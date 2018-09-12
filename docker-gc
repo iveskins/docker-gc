@@ -54,20 +54,21 @@ LOG_TO_SYSLOG=${LOG_TO_SYSLOG:=0}
 SYSLOG_FACILITY=${SYSLOG_FACILITY:=user}
 SYSLOG_LEVEL=${SYSLOG_LEVEL:=info}
 SYSLOG_TAG=${SYSLOG_TAG:=docker-gc}
-DRY_RUN=${DRY_RUN:=0}
+DRY_RUN=${DRY_RUN:=1}
 EXCLUDE_DEAD=${EXCLUDE_DEAD:=0}
 REMOVE_VOLUMES=${REMOVE_VOLUMES:=0}
 EXCLUDE_VOLUMES_IDS_FILE=${EXCLUDE_VOLUMES_IDS_FILE:=/etc/docker-gc-exclude-volumes}
+INCLUDE_LABELS=${INCLUDE_LABELS:=/etc/docker-gc-include-labels}
 VOLUME_DELETE_ONLY_DRIVER=${VOLUME_DELETE_ONLY_DRIVER:=local}
 PIDFILE=$PID_DIR/dockergc
 
 exec 3>>$PIDFILE
-if ! flock -x -n 3; then
-  echo "[$(date)] : docker-gc : Process is already running"
-  exit 1
-fi
+# if ! flock -x -n 3; then
+#   echo "[$(date)] : docker-gc : Process is already running"
+#   exit 1
+# fi
 
-trap "rm -f -- '$PIDFILE'" EXIT
+trap 'rm -f -- "$PIDFILE"' EXIT
 
 echo $$ > $PIDFILE
 
@@ -83,16 +84,23 @@ then
   EXCLUDE_CONTAINERS_FROM_GC=/dev/null
 fi
 
+INCLUDE_LABELS_TO_GC=${INCLUDE_LABELS:=/etc/docker-gc-include-labels}
+if [ ! -f "$INCLUDE_LABELS" ]
+then
+  INCLUDE_LABELS=/dev/null
+fi
+
+INCLUDE_LABELS_FILE="include_labels"
 EXCLUDE_IDS_FILE="exclude_ids"
 EXCLUDE_CONTAINER_IDS_FILE="exclude_container_ids"
 
 function date_parse {
   if date --utc >/dev/null 2>&1; then
     # GNU/date
-    echo $(date -u --date "${1}" "+%s")
+    date -u --date "${1}" "+%s"
   else
     # BSD/date
-    echo $(date -j -u -f "%F %T" "${1}" "+%s")
+    date -j -u -f "%F %T" "${1}" "+%s"
   fi
 }
 
@@ -105,7 +113,7 @@ function elapsed_time() {
     without_ms="${replace_q:0:19}"
     replace_t="${without_ms/T/ }"
     epoch=$(date_parse "${replace_t}")
-    echo $(($utcnow - $epoch))
+    echo $((utcnow - epoch))
 }
 
 function compute_exclude_ids() {
@@ -139,9 +147,8 @@ function compute_exclude_ids() {
 function compute_exclude_container_ids() {
     # Find containers matching to patterns listed in EXCLUDE_CONTAINERS_FROM_GC file
     # Implode their values with a \| separator on a single line
-    PROCESSED_EXCLUDES=`cat $EXCLUDE_CONTAINERS_FROM_GC \
-        | xargs \
-        | sed -e 's/ /\|/g'`
+    PROCESSED_EXCLUDES=$(< $EXCLUDE_CONTAINERS_FROM_GC xargs \
+        | sed -e 's/ /\|/g')
     # The empty string would match everything
     if [ "$PROCESSED_EXCLUDES" = "" ]; then
         touch $EXCLUDE_CONTAINER_IDS_FILE
@@ -155,6 +162,27 @@ function compute_exclude_container_ids() {
         | awk '{ print $1 }' \
         | tr -s " " "\012" \
         | sort -u > $EXCLUDE_CONTAINER_IDS_FILE
+}
+
+function compute_include_container_ids() {
+    # Find containers matching to patterns listed in INCLUDE_LABELS_TO_GC file
+    # Implode their values with a \| separator on a single line
+    PROCESSED_INCLUDES=$( \
+      while IFS='' read -r line || [[ -n "$line" ]];
+        do  printf '%s ' "--filter=$line";
+      done < $INCLUDE_LABELS_TO_GC)
+    # if file empty match everything
+    if [ "$PROCESSED_INCLUDES" = "" ]; then
+        echo ".*" > $INCLUDE_LABELS_FILE
+        return
+    fi
+    log "include filters are $PROCESSED_INCLUDES"
+    # Find all docker images
+    # Filter out with matching names
+    # and put them to $INCLUDE_LABELS_FILE
+    $DOCKER ps -a --format {{.ID}} $PROCESSED_INCLUDES > $INCLUDE_LABELS_FILE
+    log "filtered containers ids are is $(cat "$INCLUDE_LABELS_FILE")"
+
 }
 
 function log() {
@@ -172,7 +200,7 @@ function container_log() {
 
     while IFS='' read -r containerid
     do
-        log "$prefix $containerid $(${DOCKER} inspect -f {{.Name}} $containerid)"
+        log "$prefix $containerid $(${DOCKER} inspect -f '{{.Name}}' "$containerid")"
     done < "$filename"
 }
 
@@ -182,7 +210,7 @@ function image_log() {
 
     while IFS='' read -r imageid
     do
-        log "$prefix $imageid $(${DOCKER} inspect -f {{.RepoTags}} $imageid)"
+        log "$prefix $imageid $(${DOCKER} inspect -f '{{.RepoTags}}' "$imageid")"
     done < "$filename"
 }
 
@@ -219,6 +247,9 @@ compute_exclude_ids
 # compute ids of containers to exclude from GC
 compute_exclude_container_ids
 
+# compute ids of containers to include in GC
+compute_include_container_ids
+
 # List containers that are not running
 comm -23 containers.all containers.running > containers.exited
 
@@ -233,35 +264,39 @@ fi
 container_log "Container not running" containers.exited
 
 # Find exited containers that finished at least GRACE_PERIOD_SECONDS ago
-> containers.reap.tmp
-cat containers.exited | while read line
+: > containers.reap.tmp
+while read -r line
 do
-    EXITED=$(${DOCKER} inspect -f "{{json .State.FinishedAt}}" ${line})
-    ELAPSED=$(elapsed_time $EXITED)
+    EXITED=$(${DOCKER} inspect -f "{{json .State.FinishedAt}}" "${line}")
+    ELAPSED=$(elapsed_time "$EXITED")
     if [[ $ELAPSED -gt $GRACE_PERIOD_SECONDS ]]; then
-        echo $line >> containers.reap.tmp
+        echo "$line" >> containers.reap.tmp
     fi
-done
+done < containers.exited
+
+# container_log "Containers to reap older than grace period" containers.reap.tmp
 
 # List containers that we will remove and exclude ids.
-cat containers.reap.tmp | sort | uniq | grep -v -f $EXCLUDE_CONTAINER_IDS_FILE > containers.reap || true
-
+# comm -23 <( sort -u containers.reap.tmp) $EXCLUDE_CONTAINER_IDS_FILE > containers.reap || true
+#
+# log "containers to reap after exclude by id $(cat containers.reap)"
+# echo " labels are $(cat $INCLUDE_LABELS_FILE)"
+comm -23 <( sort -u containers.reap.tmp) $EXCLUDE_CONTAINER_IDS_FILE | grep -f $INCLUDE_LABELS_FILE  > containers.reap || true
+# echo "$(cat containers.reap)"
+container_log "containers to reap, older than grace period, exclude by id and included by label" containers.reap
 # List containers that we will keep.
 comm -23 containers.all containers.reap > containers.keep
 
 # List images used by containers that we keep.
-cat containers.keep |
-xargs -n 1 $DOCKER inspect -f '{{.Image}}' 2>/dev/null |
+< containers.keep xargs -n 1 $DOCKER inspect -f '{{.Image}}' 2>/dev/null |
 sort | uniq > images.used
 
 # List images to reap; images that existed last run and are not in use.
-echo -n "" > images.all
-$DOCKER images | while read line
+: > images.all
+docker images --format '{{.Repository}}' | sort | uniq \
+ | while read -r line
 do
-    awk '{print $1};'
-done | sort | uniq | while read line
-do
-  $DOCKER images --no-trunc --format "{{.ID}} {{.CreatedAt}}" $line \
+  $DOCKER images --no-trunc --format "{{.ID}} {{.CreatedAt}}" "$line" \
     | sort -k 2 -r \
     | tail -n +$((MINIMUM_IMAGES_TO_SAVE+1)) \
     | cut -f 1 -d " " \
@@ -272,13 +307,13 @@ done
 $DOCKER images --no-trunc --format "{{.ID}}" --filter dangling=true >> images.all
 
 # Find images that are created at least GRACE_PERIOD_SECONDS ago
-> images.reap.tmp
-cat images.all | sort | uniq | while read line
+: > images.reap.tmp
+< images.all sort | uniq | while read -r line
 do
-    CREATED=$(${DOCKER} inspect -f "{{.Created}}" ${line})
-    ELAPSED=$(elapsed_time $CREATED)
+    CREATED=$(${DOCKER} inspect -f "{{.Created}}" "${line}")
+    ELAPSED=$(elapsed_time "$CREATED")
     if [[ $ELAPSED -gt $GRACE_PERIOD_SECONDS ]]; then
-        echo $line >> images.reap.tmp
+        echo "$line" >> images.reap.tmp
     fi
 done
 comm -23 images.reap.tmp images.used | grep -E -v -f $EXCLUDE_IDS_FILE > images.reap || true
@@ -300,8 +335,10 @@ if [[ $REMOVE_ASSOCIATED_VOLUME -gt 0 ]]; then
 fi
 # Reap containers.
 if [[ $DRY_RUN -gt 0 ]]; then
+    log "reap container dry run"
     container_log "The following container would have been removed" containers.reap
 else
+    log "reap container not dry run"
     container_log "Removing containers" containers.reap
     xargs -n 1 $DOCKER rm $FORCE_CONTAINER_FLAG --volumes=true < containers.reap &>/dev/null || true
 fi
@@ -314,6 +351,7 @@ fi
 
 # Reap images.
 if [[ $DRY_RUN -gt 0 ]]; then
+    log "reap image dry run"
     image_log "The following image would have been removed" images.reap
 else
     image_log "Removing image" images.reap
